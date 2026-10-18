@@ -28,6 +28,12 @@ abstract contract V2PauseGuard {
 ///      an exhausted probe reads as "not frozen" (exit path) or "unresolved" (risk path).
     uint256 internal constant PROBE_GAS_LIMIT = 100_000;
 
+    /// @notice An operation ID was requested that is not part of the canonical pause matrix.
+    error UnknownOperation(bytes32 operationId);
+
+    /// @notice The same operation ID was mapped to more than one canonical signature.
+    error OperationIdCollision(bytes32 operationId, bytes32 existingSelector, bytes32 incomingSelector);
+
     /// @notice A value exit was attempted while the protocol is at emergency SHUTDOWN.
     error ExitsFrozenByShutdown();
 
@@ -42,6 +48,69 @@ abstract contract V2PauseGuard {
     /// @return authority The resolved `IEmergencyControls` authority, or `address(0)` when unwired.
     function pauseAuthority() external view returns (bool resolved, address authority) {
         return _pauseAuthority();
+    }
+
+    /// @notice Returns the canonical operation ID for a function selector.
+    /// @dev Fails closed on unknown selectors. The mapping is derived from the
+///      function/interface authority in `PauseMatrix`, so a renamed function yields a
+///      different selector and therefore a different operation ID (or fails closed).
+    /// @param selector 4-byte function selector.
+    /// @return operationId Stable operation ID for the selector.
+    function operationIdForSelector(bytes4 selector) public pure returns (bytes32 operationId) {
+        operationId = PauseMatrix.operationIdForSelector(selector);
+        if (operationId == bytes32(0)) revert UnknownOperation(bytes32(selector));
+    }
+
+    /// @notice Returns the canonical operation ID for an operation name.
+    /// @dev The name is the canonical function signature (e.g. `claim(uint256)`).
+    ///      Fails closed on unknown names.
+    /// @param name Canonical function signature.
+    /// @return operationId Stable operation ID for the name.
+    function operationIdForName(string memory name) public pure returns (bytes32 operationId) {
+        operationId = PauseMatrix.operationIdForName(name);
+        if (operationId == bytes32(0)) revert UnknownOperation(bytes32(keccak256(bytes(name))));
+    }
+
+    /// @notice Returns the canonical operation ID for an operation scope.
+    /// @dev Fails closed on unknown scopes. Prevents accidental global scope by
+///      requiring an explicit matrix entry.
+    /// @param scope Operation scope.
+    /// @return operationId Stable operation ID for the scope.
+    function operationIdForScope(bytes32 scope) public pure returns (bytes32 operationId) {
+        operationId = PauseMatrix.operationIdForScope(scope);
+        if (operationId == bytes32(0)) revert UnknownOperation(scope);
+    }
+
+    /// @notice Returns the canonical operation ID for an operation scope and asserts it is not nested.
+    /// @dev Nested pauses must not silently alias a parent scope; the matrix records the
+///      parent relationship and this function fails closed when a nested scope is not
+///      explicitly authorized.
+    /// @param scope Operation scope.
+    /// @return operationId Stable operation ID for the scope.
+    function operationIdForNestedScope(bytes32 scope) public pure returns (bytes32 operationId) {
+        operationId = PauseMatrix.operationIdForNestedScope(scope);
+        if (operationId == bytes32(0)) revert UnknownOperation(scope);
+    }
+
+    /// @notice Returns the full canonical operation matrix for frontend/API consumers.
+    /// @dev The returned array is deterministic and must match `config/pause-matrix.json`.
+    /// @return ids Stable operation IDs, in matrix order.
+    /// @return scopes Scopes corresponding to each operation ID.
+    /// @return selectors Function selectors corresponding to each operation ID.
+    /// @return names Canonical function signatures corresponding to each operation ID.
+    /// @return riskIncreasing True when the operation is RISK_INCREASING.
+    function operationMatrix()
+        external
+        pure
+        returns (
+            bytes32[] memory ids,
+            bytes32[] memory scopes,
+            bytes4[] memory selectors,
+            string[] memory names,
+            bool[] memory riskIncreasing
+        )
+    {
+        return PauseMatrix.operationMatrix();
     }
 
     /// @notice Read-only classification of a scope as seen by this module's risk-increasing gates.
@@ -82,6 +151,17 @@ abstract contract V2PauseGuard {
 /// @param scope Operation scope that must not be paused.
     function _requireScopeNotPaused(bytes32 scope) internal view {
         if (isScopePaused(scope)) revert V2Errors.ProtocolPaused();
+    }
+
+    /// @notice Fail-closed gate for RISK_INCREASING operations identified by function selector.
+    /// @dev Resolves the canonical operation ID and the associated scope from the
+///      function/interface authority. Unknown selectors fail closed.
+    /// @param selector 4-byte function selector.
+    function _requireSelectorNotPaused(bytes4 selector) internal view {
+        bytes32 operationId = operationIdForSelector(selector);
+        bytes32 scope = PauseMatrix.scopeForOperation(operationId);
+        if (scope == bytes32(0)) revert UnknownOperation(operationId);
+        _requireScopeNotPaused(scope);
     }
 
     /// @notice Fail-open gate for RISK_REDUCING value exits (freezes only at protocol SHUTDOWN).
